@@ -41,6 +41,7 @@ The principal settings are:
 ```text
 judge.enabled = true
 judge.model = ""                    # empty = same alias as the session
+judge.scoring_model = ""            # System One alias that scores LLM verdicts
 judge.smart_approvals = false       # opt-in automatic approval
 judge.confidence_threshold = 0.95   # Smart Approvals confidence bar
 judge.max_context_ratio = 0.5       # fraction of judge context used for history
@@ -113,13 +114,14 @@ settings, or use `--no-judge` in the interactive CLI.
 ```
 --judge / --no-judge           Enable/disable (default: enabled)
 --judge-model ALIAS            Registered model alias for judge
+--judge-scoring-model ALIAS    System One alias that scores the judge's verdicts
 --judge-timeout SECONDS        LLM judge timeout (default: 120)
 --judge-parallel-evaluations N Concurrent evaluations per batch, 1-16 (default: 1)
 --judge-confidence FLOAT       Confidence threshold, 0-1 (default: 0.95)
 ```
 
-The same five values can be placed in the CLI's `config.toml` `[judge]`
-section. Smart Approvals is configured through the server/console admin Judge
+The same six values can be placed in the CLI's `config.toml` `[judge]`
+section (`scoring_model` for the scoring alias). Smart Approvals is configured through the server/console admin Judge
 settings, not a CLI flag—the interactive CLI prompts for approval directly.
 
 CLI flags override `config.toml` values.
@@ -172,6 +174,115 @@ CLI flags override `config.toml` values.
 The judge creates one fresh HTTP client per active batch worker and closes each
 when that worker finishes, avoiding cross-thread client sharing and stale
 connections across runs.
+
+### System One decision models
+
+A System One model, such as TypeSafe's Jev, doesn't write text. It reads a
+*state* and answers typed questions with probabilities, at `POST /v1/systemone`
+on an OpenAI-compatible base URL. Turnstone can use one as the intent judge, the
+output guard's LLM stage, or both.
+
+Define the model in the Models tab with provider **openai-compatible**, its
+`/v1` root as the base URL (`https://api.typesafe.ai/v1`, or a router serving
+it, such as `https://openrouter.ai/api/v1`), its key, a model such as
+`jev-1.14.0`, and **API surface → System One**. Detect suggests the surface for
+TypeSafe's host and for `typesafe/…` model names. Then name the alias in
+`judge.model` or `judge.output_guard_model`. The stored definition carries
+`"server_compat": {"api_surface": "systemone"}` in its capabilities. The surface
+is accepted only on `openai-compatible`.
+
+An alias with this surface can't hold a chat. It is never picked as the default
+model, offered to a coordinator or `task_agent`, or listed as a chat model. A
+chat sent to it anyway (one named as a workstream's model by hand) fails with
+the reason. Its requests use the alias's lane like any other judge call: its
+key or backend-auth mode (the credential is minted after admission), its
+`max_concurrency`, and the SDK's retries on 429, 5xx and 529. With a context
+window above 65,536, requests send `TypeSafe-Danger-Zone-Long-Context: true`,
+TypeSafe's switch for its long-context limit; leave the window at its default to
+stay under the standard 64k per request and 32k per question.
+
+**Intent judge.** Each tool call is one request. The state holds the pending
+call (tool, approval label, arguments) and the conversation since the last user
+message, trimmed to `judge.max_context_ratio` of the window as for an LLM judge.
+Three questions are asked:
+
+| Question | Type | Becomes |
+|----------|------|---------|
+| `decision` | choice: `approve` / `review` / `deny` | `recommendation`; its probability is `confidence` |
+| `risk` | choice: `low` / `medium` / `high` / `critical` | `risk_level` |
+| `on_task` | noul: the call does what the user asked | evidence |
+
+The verdict is an ordinary `llm` verdict, so Smart Approvals treats it as one:
+a call is approved without a person only when P(approve) is at or above
+`judge.confidence_threshold`, under every fail-closed rule above. One more rule
+applies: an `approve` whose own `risk` answer is `high` or `critical` becomes
+`review`, with confidence 1 − P(approve). The reasoning and evidence list the
+probabilities, and `judge_model` is the model the API says answered. A System
+One model can't call tools, so `judge.read_only_tools` doesn't apply and there
+is one turn, bounded by `judge.timeout`. A failed request, an HTTP error, or an
+answer that is missing, of the wrong type, or has probabilities outside [0, 1]
+or not summing to 1 becomes an `llm_fallback` verdict.
+
+**Scoring an LLM judge.** A System One judge reads only what it is handed.
+To keep an LLM judge's evidence gathering and still take the score from the
+decision model, leave `judge.model` on the LLM (or empty) and set
+`judge.scoring_model` to the System One alias (the **Judge scoring model** row
+in Models → Roles, or `--judge-scoring-model`). The LLM judge then also has a
+`score_call` tool:
+
+- **What the score reads.** The framework assembles the state: the pending
+  call and the conversation as the session holds them, and every `read_file`
+  and `list_directory` result the judge got, verbatim (up to 8,000 characters
+  each, newest first within a quarter of the scoring model's window, with the
+  number left out noted). The judge supplies one parameter, `analysis`: its
+  assessment, sent as `reviewer_analysis` (up to 4,000 characters). The
+  questions tell the scoring model that the analysis is the reviewer's opinion,
+  not evidence, and may have been manipulated by what it read. The judge
+  chooses what to read, and so what evidence is attached, but can't rewrite
+  that evidence.
+- **What the judge sees.** The tool returns the recommendation, its
+  probability and the risk, so an uncertain judge can read more and score
+  again, up to 3 times for each call. A further call is refused and the last
+  score stands.
+- **What decides the verdict.** The last score's recommendation, confidence
+  and risk replace the LLM's, read from the scoring response, not from the
+  LLM's JSON. The same mapping as a System One judge applies, the hold for an
+  approve at high or critical risk included. The LLM's intent summary,
+  reasoning and evidence stay, with the score's probabilities appended, and
+  `judge_model` reads `<llm model> + <scoring model>`. Smart Approvals thus
+  compares the scoring model's P(approve) with `judge.confidence_threshold`.
+- **Unscored and failed verdicts.** A judge that answers without calling
+  `score_call` has its reasoning scored before the verdict is delivered. A
+  score that can't be had (an HTTP error, a timeout, a malformed answer) gives
+  an `llm_fallback` verdict, never the LLM's own confidence.
+- **An alias that can't be used.** A set `judge.scoring_model` that isn't
+  loaded, can't be bound, or isn't a System One model stops the judge, as an
+  unusable `judge.model` does. It is never dropped in favour of the LLM's own
+  confidence. The Models tab refuses to delete, disable or rename a model it
+  names. A change to the setting replaces the judge at the next batch. With
+  `judge.model` itself a System One alias, the setting is ignored.
+
+Each score is one more request after the evidence loop, bounded by
+`judge.timeout`. The read-only tools need `judge.read_only_tools`. With it off,
+the judge has only `score_call`, and the score reads the pending call, the
+conversation and the analysis.
+
+**Output guard.** Each judged result is one request. The state holds the tool
+name, its description, its arguments, the regex stage's finding, and the output
+(redacted where the regex stage redacted it). The questions are a `risk` choice
+(`none` / `low` / `medium` / `high`) and one noul per flag in the fixed
+vocabulary (`output_guard.JUDGE_SYMBOLS`), each the statement that the output
+does what that flag describes. A flag is raised at 0.7 or above, TypeSafe's
+suggested starting point for a yes, only when the risk answer is above `none`,
+and at most four are raised, most probable first. The gate is there because a
+flag's statement is answered literally: plain output can read as true for one
+(a tool's output does come from a tool), while the overall risk answer
+separates benign output from hostile output far more cleanly.
+The merge with the regex stage is unchanged: the judge can raise risk but never
+lower a regex finding. No line ranges are cited. A failure is a labelled
+`llm_error` row (`invalid_systemone_response`, `provider_error: …`, `timeout`,
+`output_too_large_for_judge_window…`), and the regex stage stands.
+
 
 If the LLM judge fails or returns no verdict, a fallback verdict with tier
 `llm_fallback` is delivered via the callback, ensuring the UI always receives
@@ -587,7 +698,9 @@ Configure both at runtime through the admin Judge settings.
 
 The LLM stage (`judge.output_guard_llm`, off by default) runs the model named
 by `judge.output_guard_model`, else the one named by `judge.model`, else the
-session's model. An empty setting defers to the next; a set alias is final, so
+session's model. A [System One](#system-one-decision-models) alias answers
+typed questions in place of the prompt below; the rest of this section describes
+an LLM. An empty setting defers to the next; a set alias is final, so
 when its model can't be used no guard judge runs and the regex stage judges tool
 output alone until it can be. Only the log says so (`judge.model_unavailable`).
 On `judge.model` the guard shares that alias's `max_concurrency` with the intent

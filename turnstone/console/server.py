@@ -13933,7 +13933,7 @@ _REASONING_EFFORT_CHOICES = frozenset(
     {"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
 # Keep in sync with turnstone.core.providers._VALID_API_SURFACES.
-_API_SURFACE_CHOICES = frozenset({"chat", "responses"})
+_API_SURFACE_CHOICES = frozenset({"chat", "responses", "systemone"})
 
 
 def _model_auth_audience_allowlist(request: Request) -> frozenset[str]:
@@ -14413,12 +14413,12 @@ def _validate_dynamic_model_auth(
     return None
 
 
-def _validate_api_surface(caps: Any) -> str | None:
+def _validate_api_surface(caps: Any, provider: str = "openai-compatible") -> str | None:
     """Return an error message if ``caps["server_compat"]["api_surface"]`` is invalid.
 
     Strict equality match (no strip/lower normalisation): the persisted value
     is bound directly to the admin ``<select>`` whose options are the canonical
-    ``"chat"`` / ``"responses"`` strings, so anything else fails to round-trip
+    ``"chat"`` / ``"responses"`` / ``"systemone"`` strings, so anything else fails to round-trip
     through edit/save.  The provider factory raises ``ValueError`` at request
     time for an unknown surface; validating here turns that into a 400 at
     write time so an admin can't poison a model alias via direct API calls.
@@ -14433,6 +14433,10 @@ def _validate_api_surface(caps: Any) -> str | None:
         return None
     if not isinstance(raw, str) or raw not in _API_SURFACE_CHOICES:
         return f"Invalid server_compat.api_surface: {raw!r}"
+    # Only the openai-compatible factory reads a surface; on any other provider
+    # "systemone" would be stored, ignored, and the alias would chat.
+    if raw == "systemone" and provider != "openai-compatible":
+        return "server_compat.api_surface 'systemone' requires provider openai-compatible"
     return None
 
 
@@ -14842,6 +14846,7 @@ _FAIL_CLOSED_ROUTING_KEYS: tuple[str, ...] = (
     *_CLEARED_WITH_LAST_MODEL_KEYS,
     "judge.model",
     "judge.output_guard_model",
+    "judge.scoring_model",
 )
 
 # What a missing model stops, for each fail-closed routing setting. The 409 names only the
@@ -14855,6 +14860,7 @@ _ROUTING_KEY_STOPS: dict[str, str] = {
     "channels.default_model_alias": _STOPS_CREATES,
     "judge.model": _STOPS_JUDGE,
     "judge.output_guard_model": _STOPS_JUDGE,
+    "judge.scoring_model": _STOPS_JUDGE,
     "tools.web_fetch_alias": (
         "web_fetch can't read pages while tools.web_fetch_alias names a missing model"
     ),
@@ -15336,7 +15342,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": "capabilities must be an object; omit for defaults"},
             status_code=400,
         )
-    err_msg = _validate_api_surface(caps) or _validate_anthropic_workspace_id(caps, provider)
+    err_msg = _validate_api_surface(caps, provider) or _validate_anthropic_workspace_id(
+        caps, provider
+    )
     if err_msg:
         return JSONResponse({"error": err_msg}, status_code=400)
     capabilities = json.dumps(caps)
@@ -15651,8 +15659,9 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
                 {"error": "capabilities must be an object; omit to leave unchanged"},
                 status_code=400,
             )
-        err_msg = _validate_api_surface(caps) or _validate_anthropic_workspace_id(
-            caps, str(updates.get("provider", existing.get("provider", "openai")))
+        effective_provider = str(updates.get("provider", existing.get("provider", "openai")))
+        err_msg = _validate_api_surface(caps, effective_provider) or (
+            _validate_anthropic_workspace_id(caps, effective_provider)
         )
         if err_msg:
             return JSONResponse({"error": err_msg}, status_code=400)

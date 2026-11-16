@@ -77,7 +77,15 @@ from turnstone.core.model_turn import (
     require_lane_capabilities,
     resolve_max_tokens_setting,
 )
-from turnstone.core.output_guard import JUDGE_SYMBOLS
+from turnstone.core.output_guard import JUDGE_SYMBOLS, MAX_JUDGE_SYMBOLS
+from turnstone.core.systemone import (
+    SystemOneError,
+    guard_questions,
+    guard_state,
+    guard_verdict_fields,
+    is_systemone_config,
+)
+from turnstone.core.systemone import ask as systemone_ask
 from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
@@ -471,6 +479,8 @@ class OutputGuardJudge:
             session_window,
         )
         self._output_budget = _resolve_output_budget(binding, config_store)
+        # A System One alias is asked typed questions; see :meth:`_evaluate_systemone`.
+        self._systemone = is_systemone_config(binding.config)
         # AUDIT label: "" on the inherited path, so recorded verdicts show
         # ``judge_model = self._model`` (the raw model id), not the session alias — threading the
         # alias into this field would silently change recorded judge_model values across the
@@ -709,6 +719,21 @@ class OutputGuardJudge:
         timeout = max(self._config.output_guard_llm_timeout, 1.0)
         if cancel_event is not None and cancel_event.is_set():
             return self._error_verdict(verdict_id, call_id, start, "cancelled")
+        if self._systemone:
+            return self._evaluate_systemone(
+                output,
+                func_name=func_name,
+                call_id=call_id,
+                tool_description=tool_description,
+                tool_args=tool_args,
+                heuristic_risk=heuristic_risk,
+                heuristic_flags=heuristic_flags,
+                cancel_event=cancel_event,
+                backend_auth_resolver=backend_auth_resolver,
+                timeout=timeout,
+                start=start,
+                verdict_id=verdict_id,
+            )
 
         def _judge_turns(*, numbered: bool) -> list[Turn]:
             return [
@@ -930,6 +955,130 @@ class OutputGuardJudge:
             lines=_parse_line_ranges(data.get("lines")) if numbered else (),
             confidence=confidence,
             judge_model=self._judge_model_alias or self._model,
+            latency_ms=int((time.monotonic() - start) * 1000),
+        )
+
+    def _evaluate_systemone(
+        self,
+        output: str,
+        *,
+        func_name: str,
+        call_id: str,
+        tool_description: str,
+        tool_args: str,
+        heuristic_risk: str,
+        heuristic_flags: tuple[str, ...] | list[str],
+        cancel_event: threading.Event | None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None,
+        timeout: float,
+        start: float,
+        verdict_id: str,
+    ) -> OutputJudgeVerdict:
+        """Judge tool output on a System One lane: an overall risk plus one Noul per symbol.
+
+        The state holds the output as a field of its own, so no fence or line
+        numbers are needed (and no ``lines`` are cited).  Output the window
+        can't hold is skipped with the same labelled ``output_too_large`` row
+        as the LLM path.  Every failure is an error verdict; the regex stage stands.
+        """
+        state = guard_state(
+            output,
+            func_name=func_name,
+            tool_description=tool_description,
+            tool_args=tool_args,
+            heuristic_risk=heuristic_risk,
+            heuristic_flags=heuristic_flags,
+        )
+        prompt_tokens = int(
+            _estimate_tokens(output + tool_args + tool_description) * _ESTIMATE_UNDERCOUNT
+        )
+        prompt_limit = self._judge_context_window * _MAX_PROMPT_RATIO
+        if prompt_tokens > prompt_limit:
+            log.warning(
+                "output_guard_judge.output_too_large",
+                call_id=call_id,
+                func_name=func_name,
+                output_chars=len(output),
+                est_prompt_tokens=prompt_tokens,
+                judge_context_window=self._judge_context_window,
+            )
+            return self._error_verdict(
+                verdict_id,
+                call_id,
+                start,
+                f"output_too_large_for_judge_window: up to ~{prompt_tokens} tok "
+                f"> {int(prompt_limit)} of a {self._judge_context_window} window",
+            )
+        try:
+            client = self._create_client()
+        except Exception as e:
+            return self._error_verdict(
+                verdict_id, call_id, start, f"client_create_failed: {type(e).__name__}"
+            )
+        lane = replace(self._lane, client=client, backend_auth_resolver=backend_auth_resolver)
+        questions = guard_questions(JUDGE_SYMBOLS)
+
+        # Same lease pairing as the LLM path: the abandoned worker keeps the
+        # cached client alive until it actually exits.
+        self._retain_evaluation()
+        release_lock = threading.Lock()
+        worker_released = False
+
+        def _release_worker() -> None:
+            nonlocal worker_released
+            with release_lock:
+                if worker_released:
+                    return
+                worker_released = True
+            self._end_evaluation()
+
+        handoff = _UsageHandoff(self._record_usage, model=self._model, source="output_guard")
+
+        def _ask(ref: Any) -> Any:
+            try:
+                result = systemone_ask(
+                    lane,
+                    state=state,
+                    questions=questions,
+                    timeout=timeout,
+                    context_window=self._judge_context_window,
+                    cancel_ref=ref,
+                )
+                handoff.capture(result.usage)
+                return result
+            finally:
+                _release_worker()
+
+        try:
+            result = run_abortable_with_deadline(
+                _ask,
+                timeout=timeout,
+                cancel_event=cancel_event,
+                thread_name="output-guard-systemone",
+            )
+        except DeadlineCancelledError:
+            return self._error_verdict(verdict_id, call_id, start, "cancelled")
+        except DeadlineExceededError:
+            return self._error_verdict(verdict_id, call_id, start, "timeout")
+        except SystemOneError:
+            return self._error_verdict(verdict_id, call_id, start, "invalid_systemone_response")
+        except Exception as e:
+            _release_worker()
+            return self._error_verdict(
+                verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
+            )
+        finally:
+            handoff.flush()
+
+        fields = guard_verdict_fields(result.answers, JUDGE_SYMBOLS, max_flags=MAX_JUDGE_SYMBOLS)
+        return OutputJudgeVerdict(
+            verdict_id=verdict_id,
+            call_id=call_id,
+            risk_level=fields.risk_level,
+            flags=fields.flags,
+            reasoning=fields.reasoning,
+            confidence=fields.confidence,
+            judge_model=self._judge_model_alias or result.model or self._model,
             latency_ms=int((time.monotonic() - start) * 1000),
         )
 

@@ -10,7 +10,9 @@ request shaping.  This module separates three concerns:
 
 2. **API surface** — ``api_surface`` selects which OpenAI-compatible
    API surface the provider talks to: ``"chat"`` (Chat Completions,
-   the default) or ``"responses"`` (Responses API, native reasoning).
+   the default), ``"responses"`` (Responses API, native reasoning) or
+   ``"systemone"`` (System One decision models such as TypeSafe's Jev,
+   which answer typed questions for the judge and never chat).
    Stored under ``server_compat`` because it's an endpoint property,
    not a model property.
 
@@ -129,6 +131,13 @@ _PROFILES: dict[str, dict[str, Any]] = {
     "sglang": {
         "server_compat": {
             "server_type": "sglang",
+        },
+    },
+    # TypeSafe's System One models (Jev) answer typed questions at
+    # ``/v1/systemone`` and don't chat; they serve the judge and output guard.
+    "typesafe": {
+        "server_compat": {
+            "api_surface": "systemone",
         },
     },
 }

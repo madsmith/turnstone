@@ -74,7 +74,8 @@ _anthropic_compat_provider: LLMProvider | None = None
 _google_provider: LLMProvider | None = None
 
 
-_VALID_API_SURFACES = ("chat", "responses")
+_VALID_API_SURFACES = ("chat", "responses", "systemone")
+_systemone_provider: LLMProvider | None = None
 
 
 def create_provider(
@@ -91,6 +92,10 @@ def create_provider(
     - ``"responses"``      → Responses API (commercial OpenAI-compat
       endpoints like Mistral cloud, or local servers that expose the
       Responses surface).
+    - ``"systemone"``      → System One decision models (``/v1/systemone``,
+      e.g. TypeSafe's Jev): a provider that refuses every chat request;
+      the judge and the output guard ask it typed questions instead
+      (:mod:`turnstone.core.systemone`).
 
     Ignored for non-OpenAI providers — both Anthropic lanes
     (``"anthropic"`` and ``"anthropic-compatible"``) talk to the
@@ -108,6 +113,7 @@ def create_provider(
     rather than ``provider.provider_name``.
     """
     global _anthropic_provider, _anthropic_compat_provider, _google_provider  # noqa: PLW0603
+    global _systemone_provider  # noqa: PLW0603
     if provider_name == "openai":
         return _openai_provider
     if provider_name == "openai-compatible":
@@ -118,6 +124,13 @@ def create_provider(
             )
         if normalised == "responses":
             return _openai_compat_responses_provider
+        if normalised == "systemone":
+            with _provider_lock:
+                if _systemone_provider is None:
+                    from turnstone.core.systemone import SystemOneProvider
+
+                    _systemone_provider = SystemOneProvider()
+                return _systemone_provider
         return _openai_compat_provider
     if provider_name == "xai":
         return _xai_provider
