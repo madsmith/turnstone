@@ -665,7 +665,9 @@ class TestScoringModel:
         session = resolve_model_binding(registry, "chat")
         with pytest.raises(JudgeModelUnavailableError, match="not a System One model"):
             IntentJudge(JudgeConfig(scoring_model="chat"), session)
-        with pytest.raises(JudgeModelUnavailableError):
+        # Named as the scoring model, not the judge model (seen live: a node that
+        # hadn't synced the definition logged "judge model 'OpenJev'").
+        with pytest.raises(JudgeModelUnavailableError, match="^judge scoring model 'missing'"):
             IntentJudge(JudgeConfig(scoring_model="missing"), session)
 
     def test_a_system_one_judge_ignores_it(self) -> None:
