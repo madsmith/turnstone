@@ -539,6 +539,7 @@ def _api_surface_of(cfg: ModelConfig) -> str | None:
 UTILITY_ROLE_SETTINGS: tuple[str, ...] = (
     "judge.model",
     "judge.output_guard_model",
+    "judge.scoring_model",
     "audio.stt_model_alias",
     "audio.tts_model_alias",
     "perception.model_alias",
@@ -546,16 +547,31 @@ UTILITY_ROLE_SETTINGS: tuple[str, ...] = (
 )
 
 
-def serves_chat(capabilities: Mapping[str, Any], model: str) -> bool:
+def serves_chat(
+    capabilities: Mapping[str, Any],
+    model: str,
+    server_compat: Mapping[str, Any] | None = None,
+) -> bool:
     """Whether a definition can hold a chat, and so be picked as the default.
 
     Definitions carry no kind, so the capabilities decide: a reranker
-    (``supports_rerank``) or a dedicated speech model
+    (``supports_rerank``), a System One decision model (``server_compat``
+    ``api_surface = "systemone"``) or a dedicated speech model
     (:func:`turnstone.core.audio.is_speech_only_model`) can't. Shared by every
     automatic default pick (the loader, the Models tab, the console's first
     model); an alias an operator configures is taken as given.
+
+    A stored row keeps ``server_compat`` inside its capabilities; a loaded
+    :class:`ModelConfig` holds it apart, so callers holding one pass it as
+    *server_compat*.
     """
     if capabilities.get("supports_rerank"):
+        return False
+    from turnstone.core.systemone import is_systemone_server_compat
+
+    if is_systemone_server_compat(capabilities.get("server_compat")) or (
+        is_systemone_server_compat(server_compat)
+    ):
         return False
     # Imported here: audio imports model_turn, which reaches back to this module.
     from turnstone.core.audio import is_speech_only_model
@@ -1003,7 +1019,11 @@ class ModelRegistry:
         rule applies: a judge set by ``--judge-model`` or ``[judge] model`` stays listed.
         """
         configs = self._models
-        offered = {a for a, cfg in configs.items() if serves_chat(cfg.capabilities, cfg.model)}
+        offered = {
+            a
+            for a, cfg in configs.items()
+            if serves_chat(cfg.capabilities, cfg.model, cfg.server_compat)
+        }
         if config_store is None or not config_store.get("model.hide_utility_aliases"):
             return sorted(offered)
         utility = {str(config_store.get(key) or "").strip() for key in UTILITY_ROLE_SETTINGS}
@@ -2458,6 +2478,12 @@ def _detect_openai_compat(
         result["server_type"] = "openai"
     elif base_url and (_hostname == "api.x.ai" or _hostname.endswith(".x.ai")):
         result["server_type"] = "xai"
+    elif (base_url and (_hostname == "typesafe.ai" or _hostname.endswith(".typesafe.ai"))) or (
+        (model_id or "").lower().startswith("typesafe/")
+    ):
+        # TypeSafe's own API, or a router (OpenRouter) serving its models:
+        # System One decision models (suggests api_surface "systemone").
+        result["server_type"] = "typesafe"
     elif meta is not None and "n_ctx_train" in meta:
         result["server_type"] = "llama.cpp"
     elif "sglang" in owned_by.lower():

@@ -7,6 +7,7 @@ is a fast, pure-function rule engine with zero external dependencies.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import itertools
 import json
@@ -37,6 +38,16 @@ from turnstone.core.model_turn import (
     resolve_model_binding,
     same_model_lane_binding,
 )
+from turnstone.core.systemone import (
+    SystemOneError,
+    SystemOneResult,
+    intent_questions,
+    intent_state,
+    intent_verdict_fields,
+    is_systemone_config,
+    state_value,
+)
+from turnstone.core.systemone import ask as systemone_ask
 from turnstone.core.trajectory import Turn
 from turnstone.core.truncation import truncate_text
 
@@ -192,6 +203,10 @@ class JudgeConfig:
 
     enabled: bool = True
     model: str = ""  # empty = use session model
+    # A System One alias that scores the LLM judge's verdict (``score_call``);
+    # empty = the LLM reports its own confidence.  Ignored when ``model`` is
+    # itself a System One alias, which judges alone.
+    scoring_model: str = ""
     smart_approvals: bool = False  # auto-approve high-confidence "approve" LLM verdicts
     confidence_threshold: float = 0.95  # Smart Approvals auto-approve bar (recommendation=approve)
     max_context_ratio: float = 0.5
@@ -1071,6 +1086,31 @@ def judge_alias(config: JudgeConfig) -> str:
     return str(config.model or "").strip()
 
 
+def scoring_alias(config: JudgeConfig) -> str:
+    """The System One alias that scores the LLM judge's verdicts, ``""`` for none."""
+    return str(config.scoring_model or "").strip()
+
+
+def resolve_scoring_binding(
+    alias: str,
+    session_binding: ResolvedModelBinding,
+    config_store: Any | None,
+) -> ResolvedModelBinding:
+    """The binding of the scoring model *alias*, which must be a System One alias.
+
+    Raises :class:`JudgeModelUnavailableError` when it doesn't bind, or binds a
+    model that isn't System One: the judge is then not built at all, never run
+    with a self-reported confidence in its place (#1529).
+    """
+    binding = resolve_judge_binding(alias, session_binding, config_store)
+    if not is_systemone_config(binding.config):
+        raise JudgeModelUnavailableError(
+            f"judge scoring model {alias!r} is not a System One model "
+            "(server_compat.api_surface 'systemone')"
+        )
+    return binding
+
+
 def resolve_judge_binding(
     alias: str,
     session_binding: ResolvedModelBinding,
@@ -1258,6 +1298,50 @@ _JUDGE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+_SCORE_CALL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "score_call",
+        "description": (
+            "Have a calibrated decision model score the pending tool call. It reads the "
+            "pending call, the conversation, every file and directory listing you read, "
+            "and your analysis, and returns probabilities for approve/review/deny, the "
+            "risk level, and whether the call is on task. Call it once you have the "
+            "evidence you need; you may read more and call it again if the score is "
+            "uncertain. Your verdict's recommendation and confidence are taken from the "
+            "last score."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "analysis": {
+                    "type": "string",
+                    "description": (
+                        "Your assessment of the pending call: what it does, what you "
+                        "checked and found, and any concern. Cite paths you read."
+                    ),
+                },
+            },
+            "required": ["analysis"],
+        },
+    },
+}
+
+# The most scores one evaluation may ask for; a later call is refused, so a
+# judge can't keep re-scoring until it gets a number it likes.
+_MAX_SCORE_CALLS = 3
+# What one piece of evidence, and the judge's analysis, may carry into the score.
+_SCORE_EVIDENCE_CAP = 8_000
+_SCORE_ANALYSIS_CAP = 4_000
+
+_SCORING_PROMPT_NOTE = """
+
+A calibrated decision model scores your verdict. Gather the evidence you need, \
+then call score_call with your analysis. Its answer decides your verdict's \
+recommendation and confidence: report them as it returned them. If you never \
+call it, your reasoning is scored when you answer."""
+
+
 _JUDGE_SYSTEM_PROMPT = """\
 You are an intent validation judge for an AI assistant's tool calls. \
 Your role is to evaluate whether a proposed tool call is safe, appropriate, \
@@ -1321,6 +1405,225 @@ def _fenced_object(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _recent_history(messages: list[dict[str, Any]], budget_chars: int) -> list[dict[str, Any]]:
+    """The messages from the last user message onward, newest kept first within *budget_chars*.
+
+    The judge only needs the immediate request context, not the full history,
+    which keeps latency bounded as conversations grow.
+    """
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+    recent = messages[last_user_idx:] if last_user_idx is not None else messages
+
+    # Apply FIFO budget cap on the trimmed context
+    truncated: list[dict[str, Any]] = []
+    total_chars = 0
+    for msg in reversed(recent):
+        content = msg.get("content", "") or ""
+        if isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        msg_chars = len(str(content)) + len(str(msg.get("role", "")))
+        if total_chars + msg_chars > budget_chars:
+            break
+        truncated.append(msg)
+        total_chars += msg_chars
+    truncated.reverse()
+    return truncated
+
+
+def _systemone_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """One history message as System One state: role, text, and any tool calls it made.
+
+    The text is flattened the way ``_prepare_context`` flattens it for the
+    transcript, so both surfaces read the same conversation.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        text = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    else:
+        text = "" if content is None else str(content)
+    projected: dict[str, Any] = {"role": str(msg.get("role", "")), "content": text}
+    calls = []
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        calls.append({"tool": str(fn.get("name", "")), "arguments": str(fn.get("arguments", ""))})
+    if calls:
+        projected["tool_calls"] = calls
+    return projected
+
+
+class _VerdictScorer:
+    """One evaluation's scoring model: the evidence the LLM read and the scores it got.
+
+    The state each score sends is assembled here, never written by the LLM:
+    the pending call and the conversation as the session holds them, and each
+    read-only tool result verbatim (capped).  The LLM adds only its analysis,
+    sent as the reviewer's opinion.  A scoring client is built on first use and
+    closed with the evaluation.
+    """
+
+    def __init__(
+        self,
+        judge: IntentJudge,
+        *,
+        item: dict[str, Any],
+        messages: list[dict[str, Any]],
+        func_name: str,
+        func_args: Any,
+        cancel_event: threading.Event | None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None,
+    ) -> None:
+        self.started = time.monotonic()
+        self._judge = judge
+        self._item = item
+        self._messages = messages
+        self._func_name = func_name
+        self._func_args = func_args
+        self._cancel_event = cancel_event
+        self._resolver = backend_auth_resolver
+        self._evidence: list[dict[str, Any]] = []
+        self._client: Any | None = None
+        self.calls = 0
+        self.last: SystemOneResult | None = None
+        # What the last score read: the analysis and how much evidence there was.
+        self._last_input: tuple[str, int] | None = None
+
+    def add_evidence(self, tool: str, args: Any, result: str) -> None:
+        """Record one read-only tool result, as the judge read it."""
+        path = args.get("path", "") if isinstance(args, dict) else ""
+        self._evidence.append(
+            {
+                "tool": tool,
+                "path": str(path),
+                "result": honest_truncate(result, _SCORE_EVIDENCE_CAP),
+            }
+        )
+
+    def score_tool(self, analysis: str) -> str:
+        """Run ``score_call`` for the LLM and return the tool result it reads."""
+        if self.calls >= _MAX_SCORE_CALLS:
+            return (
+                f"score_call refused: the limit of {_MAX_SCORE_CALLS} scores is reached. "
+                "Render your verdict now; the last score stands."
+            )
+        result = self.score(analysis)
+        if result is None:
+            return "score_call failed: the scoring model gave no score. Render your verdict."
+        fields = intent_verdict_fields(result.answers)
+        return (
+            f"recommendation: {fields.recommendation} (confidence {fields.confidence:.2f}); "
+            f"risk: {fields.risk_level}. {fields.reasoning}"
+        )
+
+    def _state(self, analysis: str) -> dict[str, Any]:
+        judge = self._judge
+        window = judge._scoring_window
+        # The conversation takes the share an LLM judge's transcript gets; the
+        # evidence a further quarter, newest kept first.
+        budget = int(window * judge._config.max_context_ratio * _CHARS_PER_TOKEN)
+        conversation = [
+            _systemone_message(m) for m in _recent_history(self._messages, max(budget // 2, 1))
+        ]
+        evidence_budget = int(window * 0.25 * _CHARS_PER_TOKEN)
+        kept: list[dict[str, Any]] = []
+        used = 0
+        for entry in reversed(self._evidence):
+            size = len(entry["result"]) + len(entry["path"])
+            if used + size > evidence_budget:
+                break
+            kept.append(entry)
+            used += size
+        kept.reverse()
+        approval_label = str(self._item.get("approval_label", self._func_name) or self._func_name)
+        state = intent_state(
+            func_name=self._func_name,
+            approval_label=approval_label,
+            func_args=self._func_args,
+            conversation=conversation,
+        )
+        state["evidence"] = kept
+        if len(kept) < len(self._evidence):
+            state["evidence_omitted"] = len(self._evidence) - len(kept)
+        state["reviewer_analysis"] = honest_truncate(analysis, _SCORE_ANALYSIS_CAP)
+        return state
+
+    def score(self, analysis: str, *, final: bool = False) -> SystemOneResult | None:
+        """Score the call now; ``None`` when it can't be scored.  *final* skips the cap.
+
+        Asked again with the same analysis and no new evidence, the last score is
+        returned without a request and without counting against the cap: the
+        state would be the same, so the answer would be too.
+        """
+        if self.last is not None and self._last_input == (analysis, len(self._evidence)):
+            return self.last
+        if not final and self.calls >= _MAX_SCORE_CALLS:
+            return self.last
+        self.calls += 1
+        judge = self._judge
+        lane = judge._scoring_lane
+        if lane is None:
+            return None
+        if self._client is None:
+            try:
+                from turnstone.core.providers import create_client
+
+                self._client = create_client(**judge._scoring_client_args)
+            except Exception as e:
+                log.info("judge.score.client_failed", error=type(e).__name__)
+                return None
+        lane = replace(lane, client=self._client, backend_auth_resolver=self._resolver)
+        state = self._state(analysis)
+        questions = intent_questions(reviewed=True)
+        timeout = max(judge._config.timeout, 5.0)
+        handoff = _UsageHandoff(judge._record_usage, model=lane.model, source="intent")
+
+        def _ask(ref: StreamAbortRef) -> SystemOneResult:
+            result = systemone_ask(
+                lane,
+                state=state,
+                questions=questions,
+                timeout=timeout,
+                context_window=judge._scoring_window,
+                cancel_ref=ref,
+            )
+            handoff.capture(result.usage)
+            return result
+
+        try:
+            result = run_abortable_with_deadline(
+                _ask,
+                timeout=timeout,
+                cancel_event=self._cancel_event,
+                thread_name="judge-score",
+            )
+        except (DeadlineCancelledError, DeadlineExceededError):
+            return None
+        except BackendAuthUnavailableError:
+            raise
+        except Exception as e:
+            log.info(
+                "judge.score.failed",
+                error=type(e).__name__,
+                status=getattr(e, "status_code", None),
+                reason=str(e)[:200] if isinstance(e, SystemOneError) else "",
+            )
+            return None
+        finally:
+            handoff.flush()
+        self.last = result
+        self._last_input = (analysis, len(self._evidence))
+        return result
+
+    def close(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+
 class IntentJudge:
     """Session-scoped LLM judge for intent validation.
 
@@ -1380,12 +1683,45 @@ class IntentJudge:
             getattr(binding.config, "context_window", None),
             session_window,
         )
+        # A System One alias (``server_compat.api_surface = "systemone"``) is asked
+        # typed questions instead of sampled; see :meth:`_evaluate_systemone`.
+        self._systemone = is_systemone_config(binding.config)
+
+        # The scoring model (``judge.scoring_model``), pinned like the judge's
+        # own binding.  A System One judge scores itself, so it has none.
+        self._scoring_state: _JudgeBindingState | None = None
+        self._scoring_lane: ModelLane | None = None
+        self._scoring_window = 0
+        self._scoring_client_args: dict[str, str] = {}
+        requested_scoring = scoring_alias(config)
+        if requested_scoring and not self._systemone:
+            scoring = resolve_scoring_binding(requested_scoring, session_binding, config_store)
+            self._scoring_state = _JudgeBindingState(
+                binding=scoring,
+                requested_alias=requested_scoring,
+                config_store=config_store,
+                checked_registry_generation=scoring.registry_generation,
+                checked_config_version=config_version_at_start,
+            )
+            self._scoring_lane = scoring.lane
+            self._scoring_window = _positive_window(
+                getattr(scoring.config, "context_window", None), session_window
+            )
+            self._scoring_client_args = self._extract_client_config(
+                scoring.lane.client, scoring.lane.provider.provider_name
+            )
+
+    @property
+    def scores_verdicts(self) -> bool:
+        """Whether a scoring model decides this judge's recommendation and confidence."""
+        return self._scoring_lane is not None
 
     @staticmethod
-    def _fingerprint_config(config: JudgeConfig) -> tuple[str, float, float, int, bool]:
+    def _fingerprint_config(config: JudgeConfig) -> tuple[str, str, float, float, int, bool]:
         """Constructor-consumed behavior that requires a fresh judge object."""
         return (
             judge_alias(config),
+            scoring_alias(config),
             config.max_context_ratio,
             config.timeout,
             config.parallel_evaluations,
@@ -1405,7 +1741,9 @@ class IntentJudge:
         """
         if config is not None and self._fingerprint_config(config) != self._config_fingerprint:
             return False
-        return self._binding_state.is_current(session_binding)
+        if not self._binding_state.is_current(session_binding):
+            return False
+        return self._scoring_state is None or self._scoring_state.is_current(session_binding)
 
     # -- Client lifecycle helpers -------------------------------------------
 
@@ -1808,6 +2146,62 @@ class IntentJudge:
         except (TypeError, ValueError):
             func_args_json = honest_truncate(str(func_args), _VERDICT_ARG_CAP)
 
+        if self._systemone:
+            return self._evaluate_systemone(
+                item,
+                messages,
+                cancel_event,
+                lane,
+                func_name=func_name,
+                func_args=func_args,
+                func_args_json=func_args_json,
+                call_id=call_id,
+                start=start,
+            )
+
+        scorer = (
+            _VerdictScorer(
+                self,
+                item=item,
+                messages=messages,
+                func_name=func_name,
+                func_args=func_args,
+                cancel_event=cancel_event,
+                backend_auth_resolver=lane.backend_auth_resolver,
+            )
+            if self.scores_verdicts
+            else None
+        )
+        try:
+            return self._run_llm_loop(
+                item,
+                messages,
+                cancel_event,
+                lane,
+                func_name=func_name,
+                func_args_json=func_args_json,
+                call_id=call_id,
+                start=start,
+                scorer=scorer,
+            )
+        finally:
+            if scorer is not None:
+                scorer.close()
+
+    def _run_llm_loop(
+        self,
+        item: dict[str, Any],
+        messages: list[dict[str, Any]],
+        cancel_event: threading.Event | None,
+        lane: ModelLane,
+        *,
+        func_name: str,
+        func_args_json: str,
+        call_id: str,
+        start: float,
+        scorer: _VerdictScorer | None,
+    ) -> IntentVerdict | None:
+        """The multi-turn LLM evidence loop; *scorer*, when set, decides the verdict's score."""
         # Prepare context (Turn IR — lowered per call inside model_turn)
         judge_turns = self._prepare_context(item, messages)
 
@@ -1823,6 +2217,8 @@ class IntentJudge:
         tools: list[dict[str, Any]] | None = None
         if self._config.read_only_tools:
             tools = list(_JUDGE_TOOL_SCHEMAS)
+        if scorer is not None:
+            tools = [*(tools or []), _SCORE_CALL_SCHEMA]
 
         # ``lane`` is the constructor-pinned binding with only the worker's
         # fresh client substituted.  No registry/config facet is re-resolved
@@ -1915,7 +2311,7 @@ class IntentJudge:
                     )
                     if verdict:
                         log.info("judge.verdict.from_partial", turn=turn + 1)
-                        return verdict
+                        return self._finish_verdict(verdict, scorer)
                 return None
             except BackendAuthUnavailableError:
                 raise
@@ -1963,7 +2359,13 @@ class IntentJudge:
                     except (ValueError, TypeError, RecursionError):
                         tc_args = {}
 
-                    tool_result = self._exec_read_only_tool(tc_name, tc_args)
+                    if tc_name == "score_call" and scorer is not None:
+                        analysis = tc_args.get("analysis") if isinstance(tc_args, dict) else ""
+                        tool_result = scorer.score_tool(str(analysis or ""))
+                    else:
+                        tool_result = self._exec_read_only_tool(tc_name, tc_args)
+                        if scorer is not None:
+                            scorer.add_evidence(tc_name, tc_args, tool_result)
                     judge_turns.append(Turn.tool(tc.get("id", ""), tool_result))
                 turn += 1
                 continue
@@ -1978,12 +2380,15 @@ class IntentJudge:
                     func_args=func_args_json,
                 )
                 if verdict:
-                    log.info(
-                        "judge.verdict.success",
-                        recommendation=verdict.recommendation,
-                        confidence=verdict.confidence,
-                    )
-                    return verdict
+                    final = self._finish_verdict(verdict, scorer)
+                    if final is not None:
+                        log.info(
+                            "judge.verdict.success",
+                            recommendation=final.recommendation,
+                            confidence=final.confidence,
+                            scored=scorer is not None,
+                        )
+                    return final
                 # Model produced text but no parseable verdict — on last turn
                 # this means the model refused to comply with the forcing message.
                 if is_last_turn:
@@ -2013,6 +2418,148 @@ class IntentJudge:
             _JUDGE_MAX_TURNS,
         )
         return None
+
+    def _finish_verdict(
+        self, verdict: IntentVerdict, scorer: _VerdictScorer | None
+    ) -> IntentVerdict | None:
+        """The LLM's *verdict* with its recommendation, confidence and risk from *scorer*.
+
+        The LLM's own numbers are replaced, never blended: Smart Approvals reads
+        the score the framework got from the scoring model, not a figure the LLM
+        relayed.  With no score yet, its reasoning is scored now; a score that
+        can't be had returns ``None`` (an ``llm_fallback`` verdict).
+        """
+        if scorer is None:
+            return verdict
+        if scorer.last is None:
+            scorer.score(verdict.reasoning or verdict.intent_summary, final=True)
+        if scorer.last is None:
+            log.info("judge.score.unavailable", func_name=verdict.func_name)
+            return None
+        fields = intent_verdict_fields(scorer.last.answers)
+        return replace(
+            verdict,
+            recommendation=fields.recommendation,
+            confidence=fields.confidence,
+            risk_level=fields.risk_level,
+            reasoning=f"{verdict.reasoning}\n\nScore ({scorer.last.model}): {fields.reasoning}"
+            if verdict.reasoning
+            else f"Score ({scorer.last.model}): {fields.reasoning}",
+            evidence=[*verdict.evidence, *fields.evidence],
+            judge_model=f"{self._model} + {scorer.last.model}",
+            latency_ms=int((time.monotonic() - scorer.started) * 1000),
+        )
+
+    def _evaluate_systemone(
+        self,
+        item: dict[str, Any],
+        messages: list[dict[str, Any]],
+        cancel_event: threading.Event | None,
+        lane: ModelLane,
+        *,
+        func_name: str,
+        func_args: Any,
+        func_args_json: str,
+        call_id: str,
+        start: float,
+    ) -> IntentVerdict | None:
+        """Judge one call on a System One lane: one request, three typed questions.
+
+        No evidence loop runs: a System One model reads the state it is given
+        and can't call tools, so ``judge.read_only_tools`` doesn't apply.  The
+        state carries the pending call and the conversation since the last user
+        message, FIFO-trimmed to the share of the window ``_prepare_context``
+        gives the transcript.  Every failure returns ``None``, which the
+        daemon delivers as an ``llm_fallback`` verdict.
+        """
+        approval_label = str(item.get("approval_label", func_name) or func_name)
+        arguments = state_value(func_args)
+        try:
+            arg_chars = len(json.dumps(arguments, ensure_ascii=False))
+        except (TypeError, ValueError):
+            arg_chars = len(str(arguments))
+        budget_chars = int(
+            self._judge_context_window * self._config.max_context_ratio * _CHARS_PER_TOKEN
+        )
+        budget_chars = max(budget_chars - arg_chars, budget_chars // 5)
+        state = intent_state(
+            func_name=func_name,
+            approval_label=approval_label,
+            func_args=func_args,
+            conversation=[
+                _systemone_message(msg) for msg in _recent_history(messages, budget_chars)
+            ],
+        )
+        questions = intent_questions()
+        timeout = max(self._config.timeout, 5.0)
+        handoff = _UsageHandoff(self._record_usage, model=self._model, source="intent")
+
+        def _ask(ref: StreamAbortRef) -> Any:
+            result = systemone_ask(
+                lane,
+                state=state,
+                questions=questions,
+                timeout=timeout,
+                context_window=self._judge_context_window,
+                cancel_ref=ref,
+            )
+            handoff.capture(result.usage)
+            return result
+
+        log.info("judge.systemone.start", func_name=func_name, call_id=call_id[:8])
+        try:
+            result = run_abortable_with_deadline(
+                _ask,
+                timeout=timeout,
+                cancel_event=cancel_event,
+                thread_name="judge-systemone",
+            )
+        except DeadlineCancelledError:
+            return None
+        except DeadlineExceededError:
+            log.info("judge.systemone.timeout", timeout=timeout)
+            return None
+        except BackendAuthUnavailableError:
+            raise
+        except Exception as e:
+            # An SDK error's text can quote the response body, which may echo
+            # the state, so only its class and status are logged; a
+            # SystemOneError's message is this module's own short reason.
+            log.info(
+                "judge.systemone.failed",
+                error=type(e).__name__,
+                status=getattr(e, "status_code", None),
+                reason=str(e)[:200] if isinstance(e, SystemOneError) else "",
+            )
+            return None
+        finally:
+            handoff.flush()
+
+        fields = intent_verdict_fields(result.answers)
+        verdict = IntentVerdict(
+            verdict_id=uuid.uuid4().hex,
+            call_id=call_id,
+            func_name=func_name,
+            func_args=func_args_json,
+            intent_summary=f"{approval_label}: {_summarize_args(func_args)}"
+            if isinstance(func_args, dict) and func_args
+            else f"Tool call: {approval_label}",
+            risk_level=fields.risk_level,
+            confidence=fields.confidence,
+            recommendation=fields.recommendation,
+            reasoning=fields.reasoning,
+            evidence=fields.evidence,
+            tier="llm",
+            judge_model=result.model or self._model,
+            latency_ms=int((time.monotonic() - start) * 1000),
+        )
+        log.info(
+            "judge.verdict.success",
+            recommendation=verdict.recommendation,
+            confidence=verdict.confidence,
+            surface="systemone",
+        )
+        return verdict
 
     def arg_budget_chars(self) -> int:
         """Character budget for the pending call's projected ``func_args``.
@@ -2071,29 +2618,7 @@ class IntentJudge:
         budget_chars = int(budget_tokens * _CHARS_PER_TOKEN)
         budget_chars = max(budget_chars - len(tool_detail), budget_chars // 5)
 
-        # Trim to messages from the last user message onward — the judge
-        # only needs the immediate request context, not the full history.
-        # This keeps latency bounded as conversations grow.
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        recent = messages[last_user_idx:] if last_user_idx is not None else messages
-
-        # Apply FIFO budget cap on the trimmed context
-        truncated: list[dict[str, Any]] = []
-        total_chars = 0
-        for msg in reversed(recent):
-            content = msg.get("content", "") or ""
-            if isinstance(content, list):
-                content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-            msg_chars = len(str(content)) + len(str(msg.get("role", "")))
-            if total_chars + msg_chars > budget_chars:
-                break
-            truncated.append(msg)
-            total_chars += msg_chars
-        truncated.reverse()
+        truncated = _recent_history(messages, budget_chars)
 
         # Flatten history into a plaintext transcript inside a single user
         # message.  This avoids multi-turn role sequences (consecutive user/
@@ -2127,8 +2652,11 @@ class IntentJudge:
 
         transcript = "\n\n".join(transcript_lines)
 
+        system_prompt = _JUDGE_SYSTEM_PROMPT
+        if self.scores_verdicts:
+            system_prompt += _SCORING_PROMPT_NOTE
         return [
-            Turn.system(_JUDGE_SYSTEM_PROMPT),
+            Turn.system(system_prompt),
             Turn.user(
                 f"Conversation context:\n\n{transcript}\n\n"
                 "---\n\n"

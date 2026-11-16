@@ -149,6 +149,7 @@
 [judge]
 # enabled = true               # Enable intent validation
 # model = ""                   # Registered judge alias; empty = same as session
+# scoring_model = ""           # System One alias that scores the LLM judge's verdicts
 # confidence_threshold = 0.95  # Judge verdict confidence threshold
 # timeout = 120.0              # Per-turn LLM judge timeout in seconds
 # parallel_evaluations = 1     # Concurrent LLM evaluations per tool-call batch (1-16)

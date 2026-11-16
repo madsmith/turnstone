@@ -10,6 +10,36 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-16]
+
+### Added
+
+- **System One decision models can judge tool calls and tool output.** An
+  `openai-compatible` model whose API surface is set to **System One** (stored
+  as `server_compat.api_surface = "systemone"`) is asked typed questions at
+  `/v1/systemone` instead of a chat prompt. TypeSafe's Jev is one such model,
+  served by TypeSafe or a router. Named in `judge.model`, it answers whether to
+  approve, review or deny each pending call, its risk, and whether it is on
+  task. The probability of the chosen recommendation is the verdict's
+  confidence, so Smart Approvals compares P(approve) with
+  `judge.confidence_threshold`. An approve at high or critical risk is held for
+  review. Named in `judge.output_guard_model`, it rates the risk of a tool
+  result and, when that risk is above none, raises up to four vocabulary flags it
+  gives a probability of 0.7 or more.
+  Such an alias is never offered as a chat model, and a chat sent to it fails
+  with the reason. Detect suggests the surface for TypeSafe's host. See
+  [System One decision models](docs/judge.md#system-one-decision-models).
+- **An LLM judge's verdicts can be scored by a System One model.** Set
+  `judge.scoring_model` (Models → Roles → Judge scoring model, or
+  `--judge-scoring-model`) to a System One alias, and the LLM judge gains a
+  `score_call` tool. The judge still reads files to gather evidence. The score
+  reads the pending call, the conversation, those files verbatim and the
+  judge's analysis, and its recommendation, confidence and risk replace the
+  LLM's own. Smart Approvals therefore compares a calibrated P(approve) with
+  the threshold, not a confidence the LLM made up. A verdict the judge didn't
+  score is scored before it lands, and one that can't be scored goes to a
+  person. A scoring alias that can't be used stops the judge.
+
 ## [2026-11-11]
 
 ### Fixed

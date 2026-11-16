@@ -711,6 +711,21 @@ def _build_registry() -> dict[str, SettingDef]:
             "judge.output_guard_model names its own.",
         ),
         SettingDef(
+            "judge.scoring_model",
+            "str",
+            "",
+            "System One alias that scores the LLM judge's verdicts (empty = none)",
+            "judge",
+            help="A System One decision model (an openai-compatible alias whose API surface "
+            "is System One, such as TypeSafe's Jev) that scores each verdict of an LLM judge. "
+            "The judge gains a score_call tool; the verdict's recommendation, confidence and "
+            "risk come from the score, not from the LLM's own estimate, so Smart Approvals "
+            "compares the scoring model's P(approve) with the threshold. Empty: the LLM "
+            "reports its own confidence. Ignored when judge.model is itself a System One "
+            "alias. A set alias that can't be used, or isn't System One, is never replaced: "
+            "until it can be, tool calls get no LLM verdict.",
+        ),
+        SettingDef(
             "judge.smart_approvals",
             "bool",
             False,

@@ -4191,6 +4191,7 @@ class ChatSession:
         return JudgeConfig(
             enabled=setting("judge.enabled"),
             model=self._workstream_judge_model or setting("judge.model"),
+            scoring_model=setting("judge.scoring_model"),
             smart_approvals=setting("judge.smart_approvals"),
             confidence_threshold=setting("judge.confidence_threshold"),
             max_context_ratio=setting("judge.max_context_ratio"),

@@ -185,6 +185,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     "judge": {
         "enabled": "judge_enabled",
         "model": "judge_model",
+        "scoring_model": "judge_scoring_model",
         "confidence_threshold": "judge_confidence",
         "max_context_ratio": "judge_context_ratio",
         "timeout": "judge_timeout",

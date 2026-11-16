@@ -846,7 +846,11 @@ def _default_model_not_loaded(alias: str, registry: Any = None) -> str:
         loaded = [
             a
             for a in registry.list_aliases()
-            if serves_chat(registry.get_config(a).capabilities, registry.get_config(a).model)
+            if serves_chat(
+                registry.get_config(a).capabilities,
+                registry.get_config(a).model,
+                registry.get_config(a).server_compat,
+            )
         ]
         if loaded:
             others = f", or set [model] default to one of: {', '.join(loaded)}"
@@ -1841,6 +1845,16 @@ def main() -> None:
         ),
     )
     judge_group.add_argument(
+        "--judge-scoring-model",
+        dest="judge_scoring_model",
+        default="",
+        help=(
+            "System One alias (api_surface 'systemone', such as TypeSafe's Jev) that scores "
+            "the LLM judge's verdicts through a score_call tool; its probability replaces the "
+            "LLM's own confidence. A name that isn't a usable System One alias stops the judge"
+        ),
+    )
+    judge_group.add_argument(
         "--judge-timeout",
         dest="judge_timeout",
         type=float,
@@ -2008,6 +2022,7 @@ def main() -> None:
     judge_config = JudgeConfig(
         enabled=args.judge_enabled,
         model=args.judge_model,
+        scoring_model=args.judge_scoring_model,
         confidence_threshold=args.judge_confidence,
         timeout=args.judge_timeout,
         parallel_evaluations=args.judge_parallel_evaluations,

@@ -6765,6 +6765,13 @@ const MODEL_ROLES = [
     fallbackKind: "inherit",
   },
   {
+    label: "Judge scoring model",
+    description:
+      "A System One decision model (API surface System One, such as TypeSafe's Jev) that scores each verdict of an LLM judge: the judge gains a score_call tool, and the score's probability replaces the LLM's own confidence. Empty: the LLM reports its own confidence. Ignored when the Judge is itself a System One model.",
+    aliasKey: "judge.scoring_model",
+    fallbackKind: "inherit",
+  },
+  {
     label: "Output guard judge",
     description:
       "Output-guard judge that semantically evaluates tool results for camouflaged prompt injection (active when judge.output_guard_llm is enabled). Empty uses the Judge model, then the session's model.",
@@ -8730,7 +8737,7 @@ function detectModel() {
           stEl2.value = ssc.server_type;
         // Restrict to the known set so a hostile detect response can't
         // smuggle a non-listed value into the form.
-        const _SURFACE_SUGGESTABLE = { chat: 1, responses: 1 };
+        const _SURFACE_SUGGESTABLE = { chat: 1, responses: 1, systemone: 1 };
         if (ssc.api_surface && _SURFACE_SUGGESTABLE[ssc.api_surface]) {
           const asEl = document.getElementById("model-api-surface");
           if (!asEl.value) asEl.value = ssc.api_surface;
