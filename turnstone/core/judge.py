@@ -1102,7 +1102,9 @@ def resolve_scoring_binding(
     model that isn't System One: the judge is then not built at all, never run
     with a self-reported confidence in its place (#1529).
     """
-    binding = resolve_judge_binding(alias, session_binding, config_store)
+    binding = resolve_judge_binding(
+        alias, session_binding, config_store, role="judge scoring model"
+    )
     if not is_systemone_config(binding.config):
         raise JudgeModelUnavailableError(
             f"judge scoring model {alias!r} is not a System One model "
@@ -1115,6 +1117,8 @@ def resolve_judge_binding(
     alias: str,
     session_binding: ResolvedModelBinding,
     config_store: Any | None,
+    *,
+    role: str = "judge model",
 ) -> ResolvedModelBinding:
     """The binding of a judge asked for *alias*, read by construction and freshness alike.
 
@@ -1126,7 +1130,7 @@ def resolve_judge_binding(
         return _judge_binding_from_session(session_binding, config_store)
     registry = session_binding.lane.registry
     if registry is None:
-        raise JudgeModelUnavailableError(f"judge model {alias!r} has no model registry")
+        raise JudgeModelUnavailableError(f"{role} {alias!r} has no model registry")
     try:
         return resolve_model_binding(
             registry,
@@ -1137,7 +1141,7 @@ def resolve_judge_binding(
     except (ValueError, KeyError) as exc:
         # ``UnknownModelAliasError`` and ``ModelClientConstructionError`` are both
         # ValueErrors; anything else is a bug and propagates as itself.
-        raise JudgeModelUnavailableError(f"judge model {alias!r}: {exc}") from exc
+        raise JudgeModelUnavailableError(f"{role} {alias!r}: {exc}") from exc
 
 
 @dataclass
